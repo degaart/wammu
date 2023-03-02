@@ -39,17 +39,21 @@ fn oldest_file(path: &Path, ignore_file: Option<&Path>) -> Result<Option<(PathBu
     Ok(oldest.map(|(ctime,path,size)| (path,size)))
 }
 
-fn free_space(path: &Path, ignore_file: Option<&Path>) -> Result<()> {
+fn free_space(path: &Path, ignore_file: Option<&Path>, safe: bool) -> Result<()> {
     if let Some((oldest, size)) = oldest_file(path, ignore_file)? {
-        println!("Removing {} ({})", oldest.display(), HumanBytes(size));
-        std::fs::remove_file(oldest)?;
+        if !safe {
+            println!("Removing {} ({})", oldest.display(), HumanBytes(size));
+            std::fs::remove_file(oldest)?;
+        } else {
+            println!("Please remove {} ({}) and try again", oldest.display(), HumanBytes(size));
+        }
         Ok(())
     } else {
         bail!("Cannot free space at {} because there are no other files to remove", path.display())
     }
 }
 
-fn copy_file_to_file(source: &Path, dest: &Path, total: u64) -> Result<()> {
+fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Result<()> {
     println!("{source:?} -> {dest:?}");
 
     let mut infile = File::open(source)?;
@@ -70,9 +74,14 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64) -> Result<()> {
         if let Err(e) = outfile.write_all(&buffer) {
             if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
                 progress.suspend(|| {
-                    free_space(dest.parent().unwrap(), Some(dest))
+                    free_space(dest.parent().unwrap(), Some(dest), safe)
                 })?;
+                if safe {
+                    progress.finish();
+                    return Ok(());
+                }
             } else {
+                println!("Error: {e:?}");
                 bail!(e);
             }
         }
@@ -95,9 +104,11 @@ fn main() {
                 .required(true)
                 .help("Source file/directory")
         )
+        .arg(arg!(-s --safe "Do not delete any file, only display their name"))
         .get_matches();
     let source = PathBuf::from(matches.get_one::<String>("source").unwrap().as_str());
     let dest = PathBuf::from(matches.get_one::<String>("dest").unwrap().as_str());
+    let safe = matches.get_flag("safe");
 
     let source_metadata = source.metadata().expect("Failed to get source metadata");
     let dest_metadata = match dest.metadata() {
@@ -116,17 +127,17 @@ fn main() {
     } else { /* Source is file */
         if let Some(dest_metadata) = dest_metadata {
             if dest_metadata.is_file() { /* Dest is an existing file, overwrite it */
-                copy_file_to_file(&source, &dest, source_metadata.len()).unwrap();
+                copy_file_to_file(&source, &dest, source_metadata.len(), safe).unwrap();
             } else {
                 if let Some(source_filename) = source.file_name() {
                     let dest_filename = dest.join(&source_filename);
-                    copy_file_to_file(&source, &dest_filename, source_metadata.len()).unwrap();
+                    copy_file_to_file(&source, &dest_filename, source_metadata.len(), safe).unwrap();
                 } else {
                     todo!();
                 }
             }
         } else { /* Dest does not exist (we consider it the dest filename) */
-            copy_file_to_file(&source, &dest, source_metadata.len()).unwrap();
+            copy_file_to_file(&source, &dest, source_metadata.len(), safe).unwrap();
         }
     }
 }
