@@ -77,7 +77,7 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Resu
         }
     };
 
-    let mut buffer = [0_u8; 4];
+    let mut buffer = [0_u8; 65536];
     let progress = ProgressBar::new(total);
     progress.set_style(ProgressStyle::with_template(
         "[{elapsed_precise}] [{eta_precise}] {binary_bytes_per_sec} {bytes}/{total_bytes} {bar} {percent}% {wide_msg:>!}")?
