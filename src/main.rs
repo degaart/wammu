@@ -56,8 +56,27 @@ fn free_space(path: &Path, ignore_file: Option<&Path>, safe: bool) -> Result<()>
 fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Result<()> {
     println!("{source:?} -> {dest:?}");
 
+    let parent_dir = dest.parent().unwrap();
     let mut infile = File::open(source)?;
-    let mut outfile = File::create(dest)?;
+
+    let mut outfile = loop {
+        match File::create(dest) {
+            Ok(f) => {
+                break f;
+            },
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
+                    free_space(parent_dir, Some(dest), safe)?;
+                    if safe {
+                        return Ok(());
+                    }
+                } else {
+                    bail!(e);
+                }
+            }
+        }
+    };
+
     let mut buffer = [0_u8; 4];
     let progress = ProgressBar::new(total);
     progress.set_style(ProgressStyle::with_template(
