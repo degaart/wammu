@@ -66,7 +66,7 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Resu
             },
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
-                    free_space(parent_dir, Some(dest), safe)?;
+                    free_space(parent_dir, None, safe)?;
                     if safe {
                         return Ok(());
                     }
