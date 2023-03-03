@@ -75,7 +75,7 @@ fn free_space(path: &Path, ignore_file: Option<&Path>, flags: u32) -> Result<()>
     }
 }
 
-fn copy_file_to_file(source: &Path, dest: &Path, total: u64, flags: u32) -> Result<()> {
+fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, flags: u32) -> Result<()> {
     println!("{source:?} -> {dest:?}");
 
     let parent_dir = dest.parent().unwrap();
@@ -100,7 +100,9 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, flags: u32) -> Resu
         }
     };
 
-    let mut buffer = [0_u8; 65536];
+    let mut buffer: Vec<u8> = Vec::with_capacity(blocksize);
+    buffer.resize(blocksize, 0);
+
     let progress = ProgressBar::new(total);
     progress.set_style(ProgressStyle::with_template(
         "[{elapsed_precise}] [{eta_precise}] {binary_bytes_per_sec} {bytes}/{total_bytes} {bar} {percent}% {wide_msg:>!}")?
@@ -175,6 +177,9 @@ fn main() {
             Arg::new("dest")
                 .required(true)
                 .help("Source file/directory")
+        )
+        .arg(arg!(-b --"block-size" <SIZE> "Block size")
+            .default_value("128k")
         );
     for (short, long, flag, desc) in FLAGS.iter() {
         command = command.arg(
@@ -195,6 +200,28 @@ fn main() {
         }
     }
 
+    let mut blocksize = matches.get_one::<String>("block-size").unwrap().as_str();
+    let mut blocksize_unit: usize = 1;
+    if blocksize.ends_with('k') || blocksize.ends_with('K') {
+        blocksize_unit = 1024;
+        blocksize = &blocksize[0..blocksize.len()-1];
+    } else if blocksize.ends_with('m') || blocksize.ends_with('M') {
+        blocksize_unit = 1024 * 1024;
+        blocksize = &blocksize[0..blocksize.len()-1];
+    } else if blocksize.ends_with('g') || blocksize.ends_with('G') {
+        blocksize_unit = 1024 * 1024 * 1024;
+        blocksize = &blocksize[0..blocksize.len()-1];
+    } else if blocksize.ends_with('t') || blocksize.ends_with('T') {
+        blocksize_unit = 1024 * 1024 * 1024 * 1024;
+        blocksize = &blocksize[0..blocksize.len()-1];
+    }
+    let blocksize = if let Ok(blocksize) = usize::from_str_radix(blocksize, 10) {
+        blocksize * blocksize_unit
+    } else {
+        panic!("Invalid blocksize: {:?}", matches.get_one::<String>("blocksize").unwrap().as_str());
+    };
+    println!("Blocksize: {}", HumanBytes(blocksize as u64));
+
     let source_metadata = source.metadata().expect("Failed to get source metadata");
     let dest_metadata = match dest.metadata() {
         Ok(metadata) => Some(metadata),
@@ -212,17 +239,17 @@ fn main() {
     } else { /* Source is file */
         if let Some(dest_metadata) = dest_metadata {
             if dest_metadata.is_file() { /* Dest is an existing file, overwrite it */
-                copy_file_to_file(&source, &dest, source_metadata.len(), flags).unwrap();
+                copy_file_to_file(&source, &dest, source_metadata.len(), blocksize, flags).unwrap();
             } else {
                 if let Some(source_filename) = source.file_name() {
                     let dest_filename = dest.join(&source_filename);
-                    copy_file_to_file(&source, &dest_filename, source_metadata.len(), flags).unwrap();
+                    copy_file_to_file(&source, &dest_filename, source_metadata.len(), blocksize, flags).unwrap();
                 } else {
                     todo!();
                 }
             }
         } else { /* Dest does not exist (we consider it the dest filename) */
-            copy_file_to_file(&source, &dest, source_metadata.len(), flags).unwrap();
+            copy_file_to_file(&source, &dest, source_metadata.len(), blocksize, flags).unwrap();
         }
     }
 }
