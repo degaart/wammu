@@ -1,8 +1,30 @@
 #![allow(unused)]
 
-use std::{path::{PathBuf, Path}, io::{ErrorKind, Read, Write}, fs::{File, DirEntry}, time::SystemTime};
+use std::{fs, path::{PathBuf, Path}, io::{ErrorKind, Read, Write}, fs::{File, DirEntry}, time::SystemTime, ffi::CString, os::unix::prelude::MetadataExt};
 use anyhow::{Result, bail};
+use clap::ArgAction;
 use indicatif::{ProgressBar, style::ProgressStyle, HumanBytes};
+use filetime::FileTime;
+
+const FLAG_SAFE: u32            = (1 << 0);
+const FLAG_PRESERVE_PERMS: u32  = (1 << 1);
+const FLAG_PRESERVE_OWNER: u32  = (1 << 2);
+const FLAG_PRESERVE_GROUP: u32  = (1 << 3);
+const FLAG_PRESERVE_MTIME: u32  = (1 << 4);
+const FLAG_ARCHIVE: u32 = 
+    FLAG_PRESERVE_PERMS |
+    FLAG_PRESERVE_OWNER |
+    FLAG_PRESERVE_GROUP |
+    FLAG_PRESERVE_MTIME;
+
+const FLAGS: [(char, &str, u32, &str); 6] = [
+    ('s', "safe", FLAG_SAFE, "Do not delete any files"),
+    ('a', "archive", FLAG_ARCHIVE, "Equivalent to -pogt"),
+    ('p', "perms", FLAG_PRESERVE_PERMS, "Preserve permissions"),
+    ('o', "owner", FLAG_PRESERVE_OWNER, "Preserve owners"),
+    ('g', "group", FLAG_PRESERVE_GROUP, "Preserve groups"),
+    ('t', "times", FLAG_PRESERVE_MTIME, "Preserve modification times"),
+];
 
 fn file_info(entry: &DirEntry) -> Result<(bool, SystemTime, u64)> {
     let metadata = entry.metadata()?;
@@ -21,7 +43,7 @@ fn oldest_file(path: &Path, ignore_file: Option<&Path>) -> Result<Option<(PathBu
     /* timestamp, path, size */
     let mut oldest = None::<(SystemTime,PathBuf,u64)>;
 
-    for f in std::fs::read_dir(path)? {
+    for f in fs::read_dir(path)? {
         let entry = f?;
         if let Ok((is_file, ctime, size)) = file_info(&entry) {
             if is_file && (ignore_file.is_none() || &entry.path() != ignore_file.as_ref().unwrap()) {
@@ -39,11 +61,11 @@ fn oldest_file(path: &Path, ignore_file: Option<&Path>) -> Result<Option<(PathBu
     Ok(oldest.map(|(ctime,path,size)| (path,size)))
 }
 
-fn free_space(path: &Path, ignore_file: Option<&Path>, safe: bool) -> Result<()> {
+fn free_space(path: &Path, ignore_file: Option<&Path>, flags: u32) -> Result<()> {
     if let Some((oldest, size)) = oldest_file(path, ignore_file)? {
-        if !safe {
+        if flags & FLAG_SAFE == 0 {
             println!("Removing {} ({})", oldest.display(), HumanBytes(size));
-            std::fs::remove_file(oldest)?;
+            fs::remove_file(oldest)?;
         } else {
             println!("Please remove {} ({}) and try again", oldest.display(), HumanBytes(size));
         }
@@ -53,10 +75,11 @@ fn free_space(path: &Path, ignore_file: Option<&Path>, safe: bool) -> Result<()>
     }
 }
 
-fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Result<()> {
+fn copy_file_to_file(source: &Path, dest: &Path, total: u64, flags: u32) -> Result<()> {
     println!("{source:?} -> {dest:?}");
 
     let parent_dir = dest.parent().unwrap();
+    let metadata = source.metadata()?;
     let mut infile = File::open(source)?;
 
     let mut outfile = loop {
@@ -66,8 +89,8 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Resu
             },
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
-                    free_space(parent_dir, None, safe)?;
-                    if safe {
+                    free_space(parent_dir, None, flags)?;
+                    if flags & FLAG_SAFE != 0 {
                         return Ok(());
                     }
                 } else {
@@ -93,9 +116,9 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Resu
         if let Err(e) = outfile.write_all(&buffer) {
             if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
                 progress.suspend(|| {
-                    free_space(dest.parent().unwrap(), Some(dest), safe)
+                    free_space(dest.parent().unwrap(), Some(dest), flags)
                 })?;
-                if safe {
+                if flags & FLAG_SAFE != 0 {
                     progress.finish();
                     return Ok(());
                 }
@@ -107,12 +130,42 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, safe: bool) -> Resu
         progress.inc(read as u64);
     }
     progress.finish();
+    drop(infile);
+    drop(outfile);
+
+    /* Restore perms */
+    if flags & FLAG_PRESERVE_PERMS != 0 {
+        fs::set_permissions(dest, metadata.permissions())?;
+    }
+
+    /* Restore owner */
+    if (flags & FLAG_PRESERVE_OWNER != 0) || (flags & FLAG_PRESERVE_GROUP != 0) {
+        unsafe {
+            use std::os::unix::ffi::OsStrExt;
+
+            let dest_metadata = dest.metadata()?;
+            let dest = CString::new(dest.as_os_str().as_bytes())?;
+
+            let uid = if flags & FLAG_PRESERVE_OWNER != 0 { metadata.uid() } else { dest_metadata.uid() };
+            let gid = if flags & FLAG_PRESERVE_GROUP != 0 { metadata.gid() } else { dest_metadata.gid() };
+            let ret = libc::chown(dest.as_ptr(), uid, gid);
+            if ret == -1 {
+                bail!(std::io::Error::last_os_error());
+            }
+        }
+    }
+
+    /* Restore mtime */
+    if flags & FLAG_PRESERVE_MTIME != 0 {
+        filetime::set_file_mtime(dest, FileTime::from_last_modification_time(&metadata))?;
+    }
+
     Ok(())
 }
 
 fn main() {
     use clap::{Command,Arg,arg,command};
-    let matches = command!()
+    let mut command = command!()
         .arg(
             Arg::new("source")
                 .required(true)
@@ -122,12 +175,25 @@ fn main() {
             Arg::new("dest")
                 .required(true)
                 .help("Source file/directory")
-        )
-        .arg(arg!(-s --safe "Do not delete any file, only display their name"))
-        .get_matches();
+        );
+    for (short, long, flag, desc) in FLAGS.iter() {
+        command = command.arg(
+            Arg::new(*long)
+                .long(*long)
+                .short(*short)
+                .help(desc)
+                .action(ArgAction::SetTrue)
+        );
+    }
+    let matches = command.get_matches();
     let source = PathBuf::from(matches.get_one::<String>("source").unwrap().as_str());
     let dest = PathBuf::from(matches.get_one::<String>("dest").unwrap().as_str());
-    let safe = matches.get_flag("safe");
+    let mut flags = 0_u32;
+    for (_, id, flag, _) in FLAGS.iter() {
+        if matches.get_flag(*id) {
+            flags |= flag;
+        }
+    }
 
     let source_metadata = source.metadata().expect("Failed to get source metadata");
     let dest_metadata = match dest.metadata() {
@@ -146,17 +212,17 @@ fn main() {
     } else { /* Source is file */
         if let Some(dest_metadata) = dest_metadata {
             if dest_metadata.is_file() { /* Dest is an existing file, overwrite it */
-                copy_file_to_file(&source, &dest, source_metadata.len(), safe).unwrap();
+                copy_file_to_file(&source, &dest, source_metadata.len(), flags).unwrap();
             } else {
                 if let Some(source_filename) = source.file_name() {
                     let dest_filename = dest.join(&source_filename);
-                    copy_file_to_file(&source, &dest_filename, source_metadata.len(), safe).unwrap();
+                    copy_file_to_file(&source, &dest_filename, source_metadata.len(), flags).unwrap();
                 } else {
                     todo!();
                 }
             }
         } else { /* Dest does not exist (we consider it the dest filename) */
-            copy_file_to_file(&source, &dest, source_metadata.len(), safe).unwrap();
+            copy_file_to_file(&source, &dest, source_metadata.len(), flags).unwrap();
         }
     }
 }
