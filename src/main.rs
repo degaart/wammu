@@ -258,13 +258,13 @@ mod tests {
     use super::*;
     use std::path::{PathBuf, Path};
 
-    const TEST_DIR: &str = "/Volumes/WammuTest/";
+    const TEST_DIR: &str = "/usr/bin";
 
     #[test]
     fn test_get_oldest() {
         let oldest = oldest_file(
             Path::new(TEST_DIR),
-            Some(Path::new("/usr/bin/ptargrep5.30"))).unwrap();
+            None).unwrap();
         dbg!(oldest);
     }
 
