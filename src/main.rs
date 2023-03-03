@@ -220,7 +220,6 @@ fn main() {
     } else {
         panic!("Invalid blocksize: {:?}", matches.get_one::<String>("blocksize").unwrap().as_str());
     };
-    println!("Blocksize: {}", HumanBytes(blocksize as u64));
 
     let source_metadata = source.metadata().expect("Failed to get source metadata");
     let dest_metadata = match dest.metadata() {
