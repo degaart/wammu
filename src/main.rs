@@ -16,14 +16,16 @@ const FLAG_ARCHIVE: u32 =
     FLAG_PRESERVE_OWNER |
     FLAG_PRESERVE_GROUP |
     FLAG_PRESERVE_MTIME;
+const FLAG_CHECK: u32 = (1 << 5);
 
-const FLAGS: [(char, &str, u32, &str); 6] = [
+const FLAGS: [(char, &str, u32, &str); 7] = [
     ('s', "safe", FLAG_SAFE, "Do not delete any files"),
     ('a', "archive", FLAG_ARCHIVE, "Equivalent to -pogt"),
     ('p', "perms", FLAG_PRESERVE_PERMS, "Preserve permissions"),
     ('o', "owner", FLAG_PRESERVE_OWNER, "Preserve owners"),
     ('g', "group", FLAG_PRESERVE_GROUP, "Preserve groups"),
     ('t', "times", FLAG_PRESERVE_MTIME, "Preserve modification times"),
+    ('c', "check", FLAG_CHECK, "Compare files after copy"),
 ];
 
 fn file_info(entry: &DirEntry) -> Result<(bool, SystemTime, u64)> {
@@ -63,7 +65,7 @@ fn oldest_file(path: &Path, ignore_file: Option<&Path>) -> Result<Option<(PathBu
 
 fn free_space(path: &Path, ignore_file: Option<&Path>, flags: u32) -> Result<()> {
     if let Some((oldest, size)) = oldest_file(path, ignore_file)? {
-        if flags & FLAG_SAFE == 0 {
+        if (flags & FLAG_SAFE) == 0 {
             println!("Removing {} ({})", oldest.display(), HumanBytes(size));
             fs::remove_file(oldest)?;
         } else {
@@ -73,6 +75,39 @@ fn free_space(path: &Path, ignore_file: Option<&Path>, flags: u32) -> Result<()>
     } else {
         bail!("Cannot free space at {} because there are no other files to remove", path.display())
     }
+}
+
+fn check(source: &Path, dest: &Path, total: u64, blocksize: usize) -> Result<()> {
+    println!("Checking {dest:?}");
+
+    if dest.metadata()?.len() != total {
+        bail!("File size mismatch");
+    }
+
+    let progress = ProgressBar::new(total);
+    progress.set_style(ProgressStyle::with_template(
+        "[{elapsed_precise}] [{eta_precise}] {binary_bytes_per_sec} {bytes}/{total_bytes} {bar} {percent}% {wide_msg:>!}")?
+    );
+
+    let mut srcbuf: Vec<u8> = Vec::with_capacity(blocksize as usize);
+    srcbuf.resize(blocksize, 0);
+
+    let mut dstbuf: Vec<u8> = Vec::with_capacity(blocksize as usize);
+    dstbuf.resize(blocksize, 0);
+
+    let mut src = File::open(source)?;
+    let mut dst = File::open(dest)?;
+    let mut total_remaining = total;
+    while total_remaining > 0 {
+        let read_block = if total_remaining as usize > blocksize { blocksize } else { total_remaining as usize };
+        src.read_exact(&mut srcbuf[0..read_block])?;
+        dst.read_exact(&mut dstbuf[0..read_block])?;
+
+        if srcbuf[0..read_block] != dstbuf[0..read_block] {
+            bail!("Source and dest contents mismatch");
+        }
+    }
+    Ok(())
 }
 
 fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, flags: u32) -> Result<()> {
@@ -90,7 +125,7 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
                     free_space(parent_dir, None, flags)?;
-                    if flags & FLAG_SAFE != 0 {
+                    if (flags & FLAG_SAFE) != 0 {
                         return Ok(());
                     }
                 } else {
@@ -111,16 +146,18 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
     let message = source.to_string_lossy().to_string();
     progress.set_message(message);
     loop {
+        let mut buf_offset = 0;
         let mut remaining = infile.read(&mut buffer)?;
         if remaining == 0 {
             break;
         }
 
         while remaining > 0 {
-            match outfile.write(&buffer) {
+            match outfile.write(&buffer[buf_offset..]) {
                 Ok(w) => {
                     progress.inc(w as u64);
                     remaining -= w;
+                    buf_offset += w;
                 },
                 Err(e) => {
                     /* EDQUOT: Disk quota exceeded */
@@ -128,7 +165,7 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
                         progress.suspend(|| {
                             free_space(dest.parent().unwrap(), Some(dest), flags)
                         })?;
-                        if flags & FLAG_SAFE != 0 {
+                        if (flags & FLAG_SAFE) != 0 {
                             progress.finish();
                             return Ok(());
                         }
@@ -145,20 +182,20 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
     drop(outfile);
 
     /* Restore perms */
-    if flags & FLAG_PRESERVE_PERMS != 0 {
+    if (flags & FLAG_PRESERVE_PERMS) != 0 {
         fs::set_permissions(dest, metadata.permissions())?;
     }
 
     /* Restore owner */
-    if (flags & FLAG_PRESERVE_OWNER != 0) || (flags & FLAG_PRESERVE_GROUP != 0) {
+    if ((flags & FLAG_PRESERVE_OWNER) != 0) || ((flags & FLAG_PRESERVE_GROUP) != 0) {
         unsafe {
             use std::os::unix::ffi::OsStrExt;
 
             let dest_metadata = dest.metadata()?;
             let dest = CString::new(dest.as_os_str().as_bytes())?;
 
-            let uid = if flags & FLAG_PRESERVE_OWNER != 0 { metadata.uid() } else { dest_metadata.uid() };
-            let gid = if flags & FLAG_PRESERVE_GROUP != 0 { metadata.gid() } else { dest_metadata.gid() };
+            let uid = if (flags & FLAG_PRESERVE_OWNER) != 0 { metadata.uid() } else { dest_metadata.uid() };
+            let gid = if (flags & FLAG_PRESERVE_GROUP) != 0 { metadata.gid() } else { dest_metadata.gid() };
             let ret = libc::chown(dest.as_ptr(), uid, gid);
             if ret == -1 {
                 bail!(std::io::Error::last_os_error());
@@ -167,8 +204,12 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
     }
 
     /* Restore mtime */
-    if flags & FLAG_PRESERVE_MTIME != 0 {
+    if (flags & FLAG_PRESERVE_MTIME) != 0 {
         filetime::set_file_mtime(dest, FileTime::from_last_modification_time(&metadata))?;
+    }
+
+    if (flags & FLAG_CHECK) != 0 {
+        return check(source, dest, total, blocksize);
     }
 
     Ok(())
