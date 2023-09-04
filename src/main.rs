@@ -111,25 +111,34 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
     let message = source.to_string_lossy().to_string();
     progress.set_message(message);
     loop {
-        let read = infile.read(&mut buffer)?;
-        if read == 0 {
+        let mut remaining = infile.read(&mut buffer)?;
+        if remaining == 0 {
             break;
         }
-        if let Err(e) = outfile.write_all(&buffer) {
-            if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
-                progress.suspend(|| {
-                    free_space(dest.parent().unwrap(), Some(dest), flags)
-                })?;
-                if flags & FLAG_SAFE != 0 {
-                    progress.finish();
-                    return Ok(());
+
+        while remaining > 0 {
+            match outfile.write(&buffer) {
+                Ok(w) => {
+                    progress.inc(w as u64);
+                    remaining -= w;
+                },
+                Err(e) => {
+                    /* EDQUOT: Disk quota exceeded */
+                    if e.raw_os_error() == Some(libc::ENOSPC) || e.raw_os_error() == Some(libc::EDQUOT) {
+                        progress.suspend(|| {
+                            free_space(dest.parent().unwrap(), Some(dest), flags)
+                        })?;
+                        if flags & FLAG_SAFE != 0 {
+                            progress.finish();
+                            return Ok(());
+                        }
+                    } else {
+                        println!("Error: {e:?}");
+                        bail!(e);
+                    }
                 }
-            } else {
-                println!("Error: {e:?}");
-                bail!(e);
             }
         }
-        progress.inc(read as u64);
     }
     progress.finish();
     drop(infile);
