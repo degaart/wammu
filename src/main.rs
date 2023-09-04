@@ -150,13 +150,15 @@ fn copy_file_to_file(source: &Path, dest: &Path, total: u64, blocksize: usize, f
     progress.set_message(message);
     loop {
         let mut buf_offset = 0;
-        let mut remaining = infile.read(&mut buffer)?;
+        let limit = infile.read(&mut buffer)?;
+        let mut remaining = limit;
         if remaining == 0 {
             break;
         }
 
         while remaining > 0 {
-            match outfile.write(&buffer[buf_offset..]) {
+            assert!(size_of_val(&buffer[buf_offset..limit]) <= remaining);
+            match outfile.write(&buffer[buf_offset..limit]) {
                 Ok(w) => {
                     progress.inc(w as u64);
                     remaining -= w;
