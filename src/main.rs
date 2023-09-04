@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::{fs, path::{PathBuf, Path}, io::{ErrorKind, Read, Write}, fs::{File, DirEntry}, time::SystemTime, ffi::CString, os::unix::prelude::MetadataExt};
+use std::{fs, path::{PathBuf, Path}, io::{ErrorKind, Read, Write}, fs::{File, DirEntry}, time::SystemTime, ffi::CString, os::unix::prelude::MetadataExt, mem::size_of_val};
 use anyhow::{Result, bail};
 use clap::ArgAction;
 use indicatif::{ProgressBar, style::ProgressStyle, HumanBytes};
@@ -100,12 +100,15 @@ fn check(source: &Path, dest: &Path, total: u64, blocksize: usize) -> Result<()>
     let mut total_remaining = total;
     while total_remaining > 0 {
         let read_block = if total_remaining as usize > blocksize { blocksize } else { total_remaining as usize };
+        assert_eq!(size_of_val(&srcbuf[0..read_block]), read_block);
         src.read_exact(&mut srcbuf[0..read_block])?;
         dst.read_exact(&mut dstbuf[0..read_block])?;
 
         if srcbuf[0..read_block] != dstbuf[0..read_block] {
             bail!("Source and dest contents mismatch");
         }
+        progress.inc(read_block as u64);
+        total_remaining -= read_block as u64;
     }
     Ok(())
 }
